@@ -85,7 +85,7 @@ def test_field_order_kept_and_methods_sorted():
 def test_private_names():
     out = text(SAMPLE)
     assert "_helper" not in out and "_SECRET" not in out
-    assert "# + 1 private module-level name" in out
+    assert "# + 2 private module-level names" in out      # _helper and _SECRET
     assert "    # private\n    def _check(self) -> bool: ..." in out
     out = text(SAMPLE, private=True)
     assert "def _helper():\n    # untyped: return\n    ..." in out and "_SECRET = 3" in out
@@ -492,7 +492,7 @@ def test_reexports_in_init_and_all(tmp_path):
             def helper() -> None: ...
             def _hidden() -> None: ...
         ''',
-        "sub/__init__.py": "",
+        "sub/__init__.py": '"""A subpackage."""',
     })
     assert main([str(tmp_path / "pkg"), "-o", str(tmp_path / "o"), "--name", "p", "--no-source-links"]) == 0
     md = (tmp_path / "o" / "p.api.md").read_text()
@@ -737,7 +737,7 @@ def test_module_anchors_are_distinct_and_dunders_are_listed():
     from pysurface.core import anchor
     assert len({anchor(p) for p in ("_version.py", "version.py", "Foo.py", "foo.py")}) == 4
     t = "\n".join(module_text(parse_module("m.py", "__all__ = ['x']\n__version__ = '1'\n_x = 2\nx = 3\n", False, False)))
-    assert t == "__all__ = ['x']\n\n__version__ = '1'"
+    assert t == "__all__ = ['x']\n\n__version__ = '1'\n\nx = 3\n\n# + 1 private module-level name"
 
 
 def test_package_init_keeps_its_short_name_and_shared_names_go_to_the_nearest(tmp_path):
@@ -824,3 +824,177 @@ def test_anchor_encodes_non_ascii_and_index_breaks_case_ties():
     mods = [parse_module("m.py", "class Atomic: ...\ndef atomic() -> None: ...\n", False, False)]
     md = render_md(mods, "t", None)
     assert md.index("- `Atomic`") < md.index("- `atomic`")
+
+
+def test_long_calls_keep_their_callee_and_leading_arguments():
+    from pysurface.core import short
+    import ast as _ast
+    s = lambda src, budget=60: short(_ast.parse(src, mode="eval").body, budget)
+    fk = "models.ForeignKey('LibraryVersion', on_delete=models.CASCADE, related_name='commits')"
+    assert s(fk) == "models.ForeignKey('LibraryVersion', ...)"
+    assert s(fk, 70) == "models.ForeignKey('LibraryVersion', on_delete=models.CASCADE, ...)"
+    assert s("f('" + "x" * 80 + "', 1)") == "f(...)"               # the first argument always shows, if only as ...
+    assert s("g(h('" + "y" * 80 + "'))") == "g(h(...))"            # nothing left out after it: no second ...
+    assert s("(a or b)(" + "c, " * 30 + "d)").startswith("(a or b)(c, ")
+    assert s("x" * 70 + "(1)") == "..."
+    assert s("[" + "1, " * 30 + "2]") == "..."
+
+
+def test_public_module_names_of_any_case_are_listed():
+    t = "\n".join(module_text(parse_module("urls.py", textwrap.dedent('''
+        app_name = 'feedback'
+        urlpatterns = [path('', view, name='home')]
+        urlpatterns += extra
+        _cache = {}
+        _cache = None
+        a, b = 1, 2
+    '''), False, False)))
+    assert t == ("app_name = 'feedback'\n\nurlpatterns = [path('', view, name='home')]\n\n"
+                 "urlpatterns += extra\n\n# + 1 private module-level name")
+
+
+def test_long_literal_values_print_one_element_per_line():
+    src = textwrap.dedent('''
+        urlpatterns = [
+            path('libraries/', LibraryList.as_view(), name='libraries'),
+            path('libraries/<slug:slug>/', LibraryDetail.as_view(), name='library-detail'),
+        ] + other + [path('x/', include('pkg.urls'))]  # the routes
+        TABLE = {'alpha': 'one ' * 1, 'beta': 'two', 'gamma': 'three', 'delta': 'four', **more}
+        BIG = [''' + ", ".join(str(i) for i in range(105)) + ''']
+        class Meta:
+            constraints = [models.UniqueConstraint(fields=['sha', 'library_version'], name='unique_sha')]
+        class LibraryList: ...
+    ''')
+    t = "\n".join(module_text(parse_module("m.py", src, False, False)))
+    assert ("urlpatterns = [\n"
+            "    path('libraries/', LibraryList.as_view(), name='libraries'),\n"
+            "    path('libraries/<slug:slug>/', LibraryDetail.as_view(), name='library-detail'),\n"
+            "] + other + [path('x/', include('pkg.urls'))]  # the routes") in t
+    assert "TABLE = {\n    'alpha': 'one ' * 1,\n    'beta': 'two',\n" in t and "    **more,\n}" in t
+    assert "    99,\n    # +5 more\n]" in t and "    100," not in t
+    assert "    constraints = [\n        models.UniqueConstraint(fields=['sha', 'library_version'], name='unique_sha'),\n    ]" in t
+    html = render_html([parse_module("m.py", src, False, False)], "t", "")
+    first = html.split('id="m.urlpatterns">urlpatterns</span> = [')[1].split("\n")[0]
+    assert first.startswith('<a class="ln" href="m.py#L2">')                          # the source link stays on the first line
+    assert '<a class="t" href="#m.LibraryList">LibraryList</a>.as_view()' in html
+    assert "))]  <span class=\"c\"># the routes</span>" in html                    # the end comment stays on the last line
+
+
+def test_parse_warnings_name_the_file(tmp_path, capsys):
+    write_files(tmp_path / "pkg", {"re_util.py": 'PATTERN = "\\d+"\n'})
+    assert main([str(tmp_path / "pkg"), "-o", str(tmp_path / "o")]) == 0
+    err = capsys.readouterr().err
+    assert "<unknown>" not in err
+    assert "warning: re_util.py: line 1: " in err and "invalid escape sequence" in err
+
+
+def test_files_with_no_statements_are_left_out(tmp_path):
+    write_files(tmp_path / "pkg", {
+        "__init__.py": "from .empty import *\nfrom . import empty, documented\n",
+        "empty/__init__.py": "# only a comment\n",
+        "empty/core.py": "def run() -> None: ...\n",
+        "documented.py": '"""Says something."""\n',
+        "private.py": "_x = 1\n",
+    })
+    assert main([str(tmp_path / "pkg"), "-o", str(tmp_path / "o"), "--name", "p", "--no-source-links"]) == 0
+    md = (tmp_path / "o" / "p.api.md").read_text()
+    html = (tmp_path / "o" / "p.api.html").read_text()
+    assert "## `empty/__init__.py`" not in md and "empty-__init__-py" not in html
+    assert "## `documented.py`" in md and "## `private.py`" in md and "## `empty/core.py`" in md
+    assert 'id="__init__.empty-import">empty</span>' in html                       # listed, no longer linked
+    assert 'id="__init__.*-import">*</span>' in html
+    assert '<a class="t" href="#documented-py">documented</a>' in html
+
+
+def test_a_value_rebinding_a_def_keeps_its_call_links(tmp_path):
+    write_files(tmp_path / "pkg", {"m.py": """
+        import functools
+        def helper(x): return x
+        helper = functools.lru_cache(helper)
+        class Maker:
+            @classmethod
+            def create(cls): ...
+        Maker = functools.total_ordering(Maker)
+        def user(): return helper(1)
+        def user2(): return Maker.create()
+    """})
+    assert main([str(tmp_path / "pkg"), "-o", str(tmp_path / "o"), "--name", "p", "--no-source-links"]) == 0
+    md = (tmp_path / "o" / "p.api.md").read_text()
+    assert "# called by: user\n" in md and "# calls: Maker.create\n" in md and "# called by: user2\n" in md
+
+
+def test_diff_hunks_name_the_value_they_change(tmp_path, capsys):
+    r = tmp_path / "repo"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    rows = lambda extra: "".join(f"    path('page{i}/', view{i}{extra if i == 5 else ''}),\n" for i in range(10))
+    (r / "urls.py").write_text(f"urlpatterns = [\n{rows('')}]\nother = [\n{rows('')}]\n")
+    git(r, "add", ".")
+    git(r, "commit", "-q", "-m", "one")
+    (r / "urls.py").write_text(f"urlpatterns = [\n{rows(', name=1')}]\nother = [\n{rows(', name=1')}]\n")
+    git(r, "commit", "-q", "-am", "two")
+    assert main([str(r), "--diff", "HEAD~1", "HEAD"]) == 0
+    out = capsys.readouterr().out
+    assert re.search(r"@@ -\S+ \+\S+ @@ urlpatterns = \[\n", out) and re.search(r"@@ -\S+ \+\S+ @@ other = \[\n", out)
+
+
+def test_round_1_shortening_and_counting_details():
+    from pysurface.core import short
+    import ast as _ast
+    t = "\n".join(module_text(parse_module("m.py", "X = {**(BASE if DEBUG else PROD), 'key_one': 'value_one', 'key_two': 'value_two'}\n",
+                                           False, False)))
+    assert "    **(BASE if DEBUG else PROD),\n" in t
+    call = _ast.parse("models.CharField(verbose_name_plural_or_something_long_keyword='x', y=1)", mode="eval").body
+    assert short(call) == "models.CharField(...)"
+    t = "\n".join(module_text(parse_module("m.py", "if A:\n    def _f(): ...\nelse:\n    def _f(): ...\n_a = 1\n_a = 2\n_c = None\ndef _c(): ...\n",
+                                           False, False)))
+    assert t == "# + 3 private module-level names"                     # counted once per name, with no blank line first
+    html = render_html([parse_module("m.py", "BIG = [" + ", ".join(map(str, range(105))) + "]\n", False, False)], "t", None)
+    assert '<span class="c">    # +5 more</span>' in html
+
+
+def test_a_scripts_variables_are_not_module_names():
+    t = "\n".join(module_text(parse_module("tool.py", textwrap.dedent('''
+        if __name__ == "__main__":
+            args = parse()
+            if args:
+                files = []
+            def run_it() -> None: ...
+        else:
+            mode = "library"
+    '''), False, False)))
+    assert "args" not in t and "files" not in t
+    assert "def run_it() -> None: ..." in t and "mode = 'library'" in t
+
+
+def test_round_2_hunk_headers_short_budget_and_warnings(tmp_path, capsys):
+    from pysurface.core import short
+    import ast as _ast
+    r = tmp_path / "repo"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    doc = lambda line: f'class A:\n    def m(self) -> None:\n        """Example:\n\n            {line}\n        """\n'
+    (r / "a.py").write_text(doc("one()") + 'P = "\\d"\n')
+    git(r, "add", ".")
+    git(r, "commit", "-q", "-m", "one")
+    (r / "a.py").write_text(doc("two()") + 'P = "\\d"\n')
+    git(r, "commit", "-q", "-am", "two")
+    assert main([str(r), "--diff", "HEAD~1", "HEAD"]) == 0
+    cap = capsys.readouterr()
+    assert re.search(r"@@ -\S+ \+\S+ @@ def m\(self\) -> None:\n", cap.out)       # not the docstring's "Example:"
+    assert cap.err.count("invalid escape sequence") == 1                         # the new ref's warning, once
+    s = lambda src, budget=60: short(_ast.parse(src, mode="eval").body, budget)
+    assert len(s("psycopg2.extras.register_default_jsonb(conn_or_curs=conn, loads=json.loads)")) <= 60
+    assert s("somefunction(aaaaaaaaaaaa, **(a or b), key='" + "k" * 60 + "')") == "somefunction(aaaaaaaaaaaa, **(a or b), ...)"
+
+
+def test_round_3_hunk_headers_skip_docstrings_and_nested_guards(tmp_path, capsys):
+    from pysurface.core import hunk_context
+    new = ["def static(prefix):", '    """Example:', "", "        urlpatterns = [", "            # changed", "        ]", '    """']
+    body = ["@@ -3,4 +3,4 @@", "         urlpatterns = [", "-            # old", "+            # changed", "         ]"]
+    assert hunk_context(body, new)[0] == "@@ -3,4 +3,4 @@ def static(prefix):"
+    new = ["class A:", "    def configure(self):", '        """One.', "", "        Two.", '        """']
+    body = ["@@ -3,2 +3,4 @@", '         """One.', "+", "+        Two.", '         """']
+    assert hunk_context(body, new)[0] == "@@ -3,2 +3,4 @@ def configure(self):"       # a blank first change
+    t = "\n".join(module_text(parse_module("g.py", 'if True:\n    if __name__ == "__main__":\n        d = 4\n', False, False)))
+    assert "d = 4" not in t

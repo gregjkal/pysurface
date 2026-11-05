@@ -1,6 +1,6 @@
 # pysurface API surface
 
-3 modules, 5 classes, 53 functions, 2 methods, 37 fields. Typed: 55 of 55 functions and methods (100%).
+3 modules, 5 classes, 63 functions, 2 methods, 39 fields. Typed: 65 of 65 functions and methods (100%).
 
 ## Contents
 
@@ -22,7 +22,14 @@ from .core import render_diff
 from .core import render_html
 from .core import render_md
 
-__all__ = ...
+__all__ = [
+    '__version__',
+    'main',
+    'parse_module',
+    'render_html',
+    'render_md',
+    'render_diff',
+]
 ```
 
 <a id="__main__-py"></a>
@@ -37,7 +44,7 @@ __all__ = ...
 
 ## `core.py` ([source](../../src/pysurface/core.py))
 
-Typed: 55 of 55 functions and methods (100%).
+Typed: 65 of 65 functions and methods (100%).
 
 ```python
 """pysurface: a compact, navigable report of a Python package's API surface.
@@ -64,7 +71,7 @@ only on the declarations; --no-calls drops the calls / called-by lines;
 Layout rules (after vibelight, a tool that does the same for Rust):
 - one section per module, in path order, opening with the module docstring;
 - re-exports first (package-internal from-imports in __init__.py, and names in __all__),
-  then classes sorted by name, then functions, then constants (capitals and dunders);
+  then classes sorted by name, then functions, then the other public module-level names;
 - every decorator is kept, since one can register a declaration (@click.command) as
   well as change it (@property);
 - a class shows its bases and decorators, its docstring, fields in declared order
@@ -72,7 +79,9 @@ Layout rules (after vibelight, a tool that does the same for Rust):
   sorted by name, public before private;
 - comments: the comment block directly above a declaration, and a comment at the
   end of a field's line, are kept with it;
-- defaults and constant values longer than 60 characters print as "...";
+- defaults and values longer than 60 characters are shortened: a call keeps its callee and
+  leading arguments, and a long literal value prints one element per line;
+- a file with no statements is left out;
 - output is deterministic: reordering or moving code within a module leaves it
   unchanged.
 """
@@ -134,6 +143,8 @@ class Module:
     reexports: list[Candidate] = field(default_factory=list)  # candidate re-exports, emptied by link_reexports
     refs: list[CallRef] = field(default_factory=list)  # calls made by module-level code, outside any def or class
     calls: list[str] = field(default_factory=list)  # resolved: quals of package functions that code calls
+    empty: bool = False  # the file holds no statements: left out of the report
+    notes: list[str] = field(default_factory=list)  # warnings Python raised while parsing it
 
 def all_names(tree: ast.Module) -> set[str]:
     """The strings in a module-level __all__ written as a list or tuple literal."""
@@ -145,7 +156,7 @@ def anchor(path: str) -> str:
     becomes "-", and any other character is written as ~ and six hex digits, so no two paths
     share one: _version.py and version.py, Foo.py and foo.py, a-b.py and a/b.py.
     """
-    # called by: call_href, link_reexports, render_html, render_md
+    # called by: call_href, link_reexports, load, render_html, render_md
 
 def args_of(fn: FuncDef) -> str:
     # calls: short
@@ -202,8 +213,8 @@ def deco_lines(node: Decorated) -> list[str]:
     # called by: make_class, make_def
 
 def deco_text(d: ast.expr) -> str:
-    """A decorator as written, with each argument longer than MAXV characters shown as "..."."""
-    # calls: short
+    """A decorator as written, with each argument longer than MAXV characters shortened as short() does."""
+    # calls: short, starred
     # called by: deco_lines
 
 def doc_block(lines: list[str], indent: str) -> list[str]:
@@ -214,6 +225,19 @@ def docstring(node: Documented, brief: bool) -> list[str]:
     # called by: make_class, make_def, parse_module
     ...
 
+def docstring_lines(lines: list[str]) -> list[bool]:
+    """Which lines of module_text output belong to a docstring, as doc_block writes them: an
+    opening line that starts with three quotes, through a closing line of three quotes alone.
+    """
+    # called by: hunk_context
+
+def enclosing(lines: list[str], i: int, line: str, doc: list[bool]) -> str:
+    """The nearest line above lines[i] that is less indented than line and starts a declaration,
+    such as "urlpatterns = [" or "class Meta:", skipping docstring lines (doc[j] is true for
+    those); "" when line is not indented.
+    """
+    # called by: hunk_context
+
 def excluded(path: str, globs: tuple[str, ...]) -> bool:
     # called by: sources_from_dir, sources_from_git
     ...
@@ -223,6 +247,10 @@ def executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
     skipped, its decorators and defaults are not.
     """
     # called by: parse_module
+
+def expandable(node: ast.BinOp) -> bool:
+    """A sum whose terms print safely side by side without parentheses, and that has a literal to expand."""
+    # called by: value_lines
 
 def first_line(node: Decorated) -> int:
     # called by: make_class, make_def
@@ -244,6 +272,13 @@ def html_lines(m: Module, names: dict[str, str], src_link: str | None, ids: Ids,
     """Render one module's declarations with anchors on every declaration and links on known type names."""
     # calls: doc_block, call_href, short_qual, gaps
     # called by: render_html
+
+def hunk_context(body: list[str], new: list[str]) -> list[str]:
+    """Name the declaration each hunk changes, as git diff does: a row of a long list value
+    does not say whose it is. Only "@@" lines change.
+    """
+    # calls: docstring_lines, enclosing
+    # called by: render_diff
 
 def import_base(node: ast.ImportFrom, mod_qual: str) -> str:
     """The module a from-import reads from, made absolute against this module's own dotted name."""
@@ -270,12 +305,16 @@ def imports_of(tree: ast.Module, mod_qual: str) -> dict[str, tuple[str, str | No
 
 def instance_attributes(cls: ast.ClassDef, known: set[str], qual: str, comments: Comments, only: set[int]) -> list[Item]:
     """Attributes assigned as self.x in __init__ (or __post_init__), in first-assignment order."""
-    # calls: short, Item, leading_comments, trailing_comment
+    # calls: value_text, Item, leading_comments, trailing_comment
     # called by: make_class
 
 def is_dunder(name: str) -> bool:
     """__all__, __version__ and the like: public despite the leading underscore."""
     # called by: parse_module, reexport_candidates
+
+def is_main_guard(node: ast.stmt) -> bool:
+    """if __name__ == "__main__": what runs only as a script, whose variables are not the module's names."""
+    # called by: main_guards
 
 def item_text(it: Item, indent: str = '', here: str = '', calls: bool = True, marks: bool = True) -> list[str]:
     # calls: comment_block, call_lines, doc_block
@@ -302,18 +341,23 @@ def link_reexports(mods: list[Module], private: bool, root_name: str = '') -> No
     # calls: import_names, closest, anchor
     # called by: load
 
-def load(args: argparse.Namespace, ref: str | None) -> list[Module]:
-    # calls: sources_from_git, sources_from_dir, InputError, parse_module, link_reexports, link_calls
+def load(args: argparse.Namespace, ref: str | None, warn: bool = True) -> list[Module]:
+    """Read, parse and link the modules. warn=False keeps parse warnings quiet, as for the old side of --diff."""
+    # calls: sources_from_git, sources_from_dir, InputError, parse_module, link_reexports, link_calls, anchor
     # called by: run
-    ...
 
 def main(argv: list[str] | None = None) -> int:
     # calls: run
     # called by: __main__.py
     ...
 
+def main_guards(body: list[ast.stmt]) -> Iterator[ast.If]:
+    """The __main__ guards among module-level statements, inside module-level if and try blocks too."""
+    # calls: is_main_guard
+    # called by: parse_module
+
 def make_class(cls: ast.ClassDef, mod_qual: str, comments: Comments, only: set[int], brief: bool, context: str | None = None) -> Item:
-    # calls: leading_comments, first_line, Item, deco_lines, docstring, short, trailing_comment, make_def, instance_attributes
+    # calls: leading_comments, first_line, Item, deco_lines, docstring, value_text, trailing_comment, make_def, instance_attributes
     # called by: parse_module
     ...
 
@@ -354,7 +398,7 @@ def package_of(mod_qual: str) -> str:
     # called by: import_base
 
 def parse_module(path: str, src: str, private: bool, brief: bool) -> Module:
-    # calls: Module, comment_map, module_statements, make_class, make_def, is_dunder, short, Item, leading_comments, trailing_comment, docstring, imports_of, +4 more
+    # calls: Module, comment_map, main_guards, module_statements, make_class, make_def, is_dunder, value_text, Item, leading_comments, trailing_comment, docstring, +5 more
     # called by: load
     ...
 
@@ -367,7 +411,7 @@ def reexport_candidates(tree: ast.Module, mod_qual: str, comments: Comments, onl
     # called by: parse_module
 
 def render_diff(old: list[Module], new: list[Module], title: str) -> str:
-    # calls: module_text
+    # calls: module_text, hunk_context
     # called by: run
     ...
 
@@ -386,8 +430,17 @@ def run(argv: list[str] | None) -> int:
     # called by: main
     ...
 
-def short(node: ast.AST) -> str:
-    # called by: args_of, deco_text, instance_attributes, make_class, parse_module
+def short(node: ast.AST, budget: int = MAXV) -> str:
+    """An expression on one line, in at most budget characters where it can be. A longer call keeps
+    its callee and as many leading arguments as fit, each shortened the same way, then "...";
+    anything else that is too long is "...".
+    """
+    # calls: starred
+    # called by: args_of, deco_text, short_pair, starred, value_lines
+
+def short_pair(k: ast.AST, v: ast.AST) -> str:
+    # calls: short
+    # called by: value_lines
     ...
 
 def short_qual(q: str, here: str) -> str:
@@ -406,6 +459,13 @@ def sources_from_git(repo: str, ref: str, root: str, skip: tuple[str, ...]) -> d
     # calls: git, excluded
     # called by: load
 
+def starred(v: ast.AST, budget: int) -> str:
+    """The operand of a **, parenthesized when it is not an atom: **(a or b). short() unparses the
+    operand on its own, which drops the parentheses that ** needs in a dict display.
+    """
+    # calls: short
+    # called by: deco_text, short, value_lines
+
 def total_coverage(mods: list[Module]) -> tuple[int, int]:
     # calls: coverage
     # called by: render_html, render_md
@@ -421,7 +481,51 @@ def untyped_of(fn: FuncDef, method: bool) -> list[str]:
     """
     # called by: make_def
 
+def value_lines(node: ast.AST) -> list[str]:
+    # calls: expandable, short, starred, short_pair
+    # called by: value_text
+    ...
+
+def value_text(node: ast.AST) -> str:
+    """An assigned value. One that is too long for a line and is a list, tuple, set or dict literal,
+    or a sum of them such as urlpatterns = [...] + other, prints one element per line, each
+    shortened as short() does to ROWV characters, up to MAXROWS elements; anything else prints
+    as short() does.
+    """
+    # calls: value_lines
+    # called by: instance_attributes, make_class, parse_module
+
+ATOMS = (
+    ast.Name,
+    ast.Attribute,
+    ast.Call,
+    ast.Subscript,
+    ast.Constant,
+    ast.List,
+    ast.Tuple,
+    ast.Set,
+    ast.Dict,
+    ast.ListComp,
+    ast.SetComp,
+    ast.DictComp,
+    ast.GeneratorExp,
+)
+
 CSS = ...
+
+CallRef = tuple[str, ...]  # ("name", n) or ("attr", base, attr): a call as written, before resolution
+
+Comments = dict[int, str]  # line number -> comment text
+
+DECL_HEAD = re.compile(...)
+
+Decorated = Union[ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef]
+
+Documented = ...
+
+FuncDef = Union[ast.FunctionDef, ast.AsyncFunctionDef]
+
+MAXROWS = 100  # elements shown of a long literal value
 
 MAXV = 60
 
@@ -429,9 +533,48 @@ MODULE_CALLER = 'module:'  # a called_by entry for a module's top-level code: "m
 
 MODULE_CALLS_LABEL = 'module-level code calls'
 
-SKIP_DIRS = ...
+OPS = {
+    ast.Add: '+',
+    ast.Sub: '-',
+    ast.Mult: '*',
+    ast.MatMult: '@',
+    ast.Div: '/',
+    ast.Mod: '%',
+    ast.Pow: '**',
+    ast.LShift: '<<',
+    ast.RShift: '>>',
+    ast.BitOr: '|',
+    ast.BitXor: '^',
+    ast.BitAnd: '&',
+    ast.FloorDiv: '//',
+}
 
-TEST_GLOBS = ...
+ROWV = 100  # characters for each of those elements, on a line of its own
+
+SKIP_DIRS = {
+    '__pycache__',
+    'node_modules',
+    '.venv',
+    'venv',
+    'build',
+    'dist',
+    '.git',
+    '.tox',
+    '.nox',
+    '.eggs',
+}
+
+TEST_GLOBS = (
+    'tests/*',
+    '*/tests/*',
+    'test/*',
+    '*/test/*',
+    'test_*.py',
+    '*/test_*.py',
+    '*_test.py',
+    'conftest.py',
+    '*/conftest.py',
+)
 
 __version__ = '0.2.0'
 ```
@@ -444,27 +587,38 @@ __version__ = '0.2.0'
 - `all_names`: [`core.py`](#core-py)
 - `anchor`: [`core.py`](#core-py)
 - `args_of`: [`core.py`](#core-py)
+- `ATOMS`: [`core.py`](#core-py)
 - `call_href`: [`core.py`](#core-py)
 - `call_lines`: [`core.py`](#core-py)
 - `call_refs`: [`core.py`](#core-py)
+- `CallRef`: [`core.py`](#core-py)
 - `Candidate`: [`core.py`](#core-py)
 - `closest`: [`core.py`](#core-py)
 - `comment_block`: [`core.py`](#core-py)
 - `comment_map`: [`core.py`](#core-py)
+- `Comments`: [`core.py`](#core-py)
 - `count`: [`core.py`](#core-py)
 - `coverage`: [`core.py`](#core-py)
 - `coverage_text`: [`core.py`](#core-py)
 - `CSS`: [`core.py`](#core-py)
+- `DECL_HEAD`: [`core.py`](#core-py)
 - `deco_lines`: [`core.py`](#core-py)
 - `deco_text`: [`core.py`](#core-py)
+- `Decorated`: [`core.py`](#core-py)
 - `doc_block`: [`core.py`](#core-py)
 - `docstring`: [`core.py`](#core-py)
+- `docstring_lines`: [`core.py`](#core-py)
+- `Documented`: [`core.py`](#core-py)
+- `enclosing`: [`core.py`](#core-py)
 - `excluded`: [`core.py`](#core-py)
 - `executed`: [`core.py`](#core-py)
+- `expandable`: [`core.py`](#core-py)
 - `first_line`: [`core.py`](#core-py)
+- `FuncDef`: [`core.py`](#core-py)
 - `gaps`: [`core.py`](#core-py)
 - `git`: [`core.py`](#core-py)
 - `html_lines`: [`core.py`](#core-py)
+- `hunk_context`: [`core.py`](#core-py)
 - `Ids`: [`core.py`](#core-py)
 - `import_base`: [`core.py`](#core-py)
 - `import_names`: [`core.py`](#core-py)
@@ -472,6 +626,7 @@ __version__ = '0.2.0'
 - `InputError`: [`core.py`](#core-py)
 - `instance_attributes`: [`core.py`](#core-py)
 - `is_dunder`: [`core.py`](#core-py)
+- `is_main_guard`: [`core.py`](#core-py)
 - `Item`: [`core.py`](#core-py)
 - `item_text`: [`core.py`](#core-py)
 - `leading_comments`: [`core.py`](#core-py)
@@ -480,8 +635,10 @@ __version__ = '0.2.0'
 - `load`: [`core.py`](#core-py)
 - `main`: [`__init__.py`](#__init__-py)
 - `main`: [`core.py`](#core-py)
+- `main_guards`: [`core.py`](#core-py)
 - `make_class`: [`core.py`](#core-py)
 - `make_def`: [`core.py`](#core-py)
+- `MAXROWS`: [`core.py`](#core-py)
 - `MAXV`: [`core.py`](#core-py)
 - `Module`: [`core.py`](#core-py)
 - `MODULE_CALLER`: [`core.py`](#core-py)
@@ -490,6 +647,7 @@ __version__ = '0.2.0'
 - `module_level_code`: [`core.py`](#core-py)
 - `module_statements`: [`core.py`](#core-py)
 - `module_text`: [`core.py`](#core-py)
+- `OPS`: [`core.py`](#core-py)
 - `package_of`: [`core.py`](#core-py)
 - `parse_module`: [`__init__.py`](#__init__-py)
 - `parse_module`: [`core.py`](#core-py)
@@ -500,13 +658,18 @@ __version__ = '0.2.0'
 - `render_html`: [`core.py`](#core-py)
 - `render_md`: [`__init__.py`](#__init__-py)
 - `render_md`: [`core.py`](#core-py)
+- `ROWV`: [`core.py`](#core-py)
 - `run`: [`core.py`](#core-py)
 - `short`: [`core.py`](#core-py)
+- `short_pair`: [`core.py`](#core-py)
 - `short_qual`: [`core.py`](#core-py)
 - `SKIP_DIRS`: [`core.py`](#core-py)
 - `sources_from_dir`: [`core.py`](#core-py)
 - `sources_from_git`: [`core.py`](#core-py)
+- `starred`: [`core.py`](#core-py)
 - `TEST_GLOBS`: [`core.py`](#core-py)
 - `total_coverage`: [`core.py`](#core-py)
 - `trailing_comment`: [`core.py`](#core-py)
 - `untyped_of`: [`core.py`](#core-py)
+- `value_lines`: [`core.py`](#core-py)
+- `value_text`: [`core.py`](#core-py)

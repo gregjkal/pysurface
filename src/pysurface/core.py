@@ -22,7 +22,7 @@ only on the declarations; --no-calls drops the calls / called-by lines;
 Layout rules (after vibelight, a tool that does the same for Rust):
 - one section per module, in path order, opening with the module docstring;
 - re-exports first (package-internal from-imports in __init__.py, and names in __all__),
-  then classes sorted by name, then functions, then constants (capitals and dunders);
+  then classes sorted by name, then functions, then the other public module-level names;
 - every decorator is kept, since one can register a declaration (@click.command) as
   well as change it (@property);
 - a class shows its bases and decorators, its docstring, fields in declared order
@@ -30,7 +30,9 @@ Layout rules (after vibelight, a tool that does the same for Rust):
   sorted by name, public before private;
 - comments: the comment block directly above a declaration, and a comment at the
   end of a field's line, are kept with it;
-- defaults and constant values longer than 60 characters print as "...";
+- defaults and values longer than 60 characters are shortened: a call keeps its callee and
+  leading arguments, and a long literal value prints one element per line;
+- a file with no statements is left out;
 - output is deterministic: reordering or moving code within a module leaves it
   unchanged.
 """
@@ -48,6 +50,7 @@ import sys
 import fnmatch
 import time
 import tokenize
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Optional, Union
@@ -59,6 +62,10 @@ Comments = dict[int, str]          # line number -> comment text
 CallRef = tuple[str, ...]          # ("name", n) or ("attr", base, attr): a call as written, before resolution
 
 MAXV = 60
+MAXROWS = 100        # elements shown of a long literal value
+ROWV = 100           # characters for each of those elements, on a line of its own
+OPS = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.MatMult: "@", ast.Div: "/", ast.Mod: "%", ast.Pow: "**",
+       ast.LShift: "<<", ast.RShift: ">>", ast.BitOr: "|", ast.BitXor: "^", ast.BitAnd: "&", ast.FloorDiv: "//"}
 __version__ = "0.2.0"
 TEST_GLOBS = ("tests/*", "*/tests/*", "test/*", "*/test/*", "test_*.py", "*/test_*.py", "*_test.py", "conftest.py", "*/conftest.py")
 SKIP_DIRS = {"__pycache__", "node_modules", ".venv", "venv", "build", "dist", ".git", ".tox", ".nox", ".eggs"}
@@ -182,6 +189,8 @@ class Module:
     reexports: list[Candidate] = field(default_factory=list)  # candidate re-exports, emptied by link_reexports
     refs: list[CallRef] = field(default_factory=list)       # calls made by module-level code, outside any def or class
     calls: list[str] = field(default_factory=list)          # resolved: quals of package functions that code calls
+    empty: bool = False                                     # the file holds no statements: left out of the report
+    notes: list[str] = field(default_factory=list)          # warnings Python raised while parsing it
 
 
 def comment_map(src: str) -> tuple[Comments, set[int]]:
@@ -221,9 +230,94 @@ def trailing_comment(node: ast.stmt, comments: Comments, only: set[int]) -> str 
     return None
 
 
-def short(node: ast.AST) -> str:
+def short(node: ast.AST, budget: int = MAXV) -> str:
+    """An expression on one line, in at most budget characters where it can be. A longer call keeps
+    its callee and as many leading arguments as fit, each shortened the same way, then "...";
+    anything else that is too long is "..."."""
     s = ast.unparse(node)
-    return s if len(s) <= MAXV else "..."
+    if len(s) <= budget:
+        return s
+    if not isinstance(node, ast.Call):
+        return "..."
+    head = ast.unparse(ast.Call(func=node.func, args=[], keywords=[]))[:-2]    # parenthesized where unparse would
+    if len(head) + len("(...)") > budget:
+        return "..."
+    args = [*node.args, *node.keywords]
+    parts: list[str] = []
+    used = len(head) + len("(, ...)")
+    for a in args:
+        prefix, value = "", a
+        if isinstance(a, ast.keyword):
+            prefix, value = (f"{a.arg}=" if a.arg else "**"), a.value
+        room = budget - used - len(prefix)
+        if room < len("...") and not parts:      # not even the keyword fits: f(...)
+            break
+        r = "..." if room < len("...") else starred(value, room) if prefix == "**" else short(value, room)
+        if r == "..." and parts:          # the first argument always shows, shortened if need be
+            break
+        parts.append(prefix + r)
+        used += len(prefix) + len(r) + len(", ")
+        if r == "...":
+            break
+    if len(parts) < len(args) and (not parts or parts[-1] != "..."):
+        parts.append("...")
+    return f"{head}({', '.join(parts) or '...'})"
+
+
+def value_text(node: ast.AST) -> str:
+    """An assigned value. One that is too long for a line and is a list, tuple, set or dict literal,
+    or a sum of them such as urlpatterns = [...] + other, prints one element per line, each
+    shortened as short() does to ROWV characters, up to MAXROWS elements; anything else prints
+    as short() does."""
+    return "\n".join(value_lines(node))
+
+
+def value_lines(node: ast.AST) -> list[str]:
+    s = ast.unparse(node)
+    if len(s) <= MAXV:
+        return [s]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and expandable(node):
+        left, right = value_lines(node.left), value_lines(node.right)
+        return left[:-1] + [f"{left[-1]} + {right[0]}"] + right[1:]
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and node.elts:
+        brackets = {ast.List: "[]", ast.Tuple: "()", ast.Set: "{}"}[type(node)]
+        rows = [short(e, ROWV) for e in node.elts]
+    elif isinstance(node, ast.Dict) and node.keys:
+        brackets = "{}"
+        rows = [f"**{starred(v, ROWV - 2)}" if k is None else short_pair(k, v) for k, v in zip(node.keys, node.values)]
+    else:
+        return [short(node)]
+    more = [f"    # +{len(rows) - MAXROWS} more"] if len(rows) > MAXROWS else []
+    return [brackets[0]] + [f"    {r}," for r in rows[:MAXROWS]] + more + [brackets[1]]
+
+
+ATOMS = (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict,
+         ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def starred(v: ast.AST, budget: int) -> str:
+    """The operand of a **, parenthesized when it is not an atom: **(a or b). short() unparses the
+    operand on its own, which drops the parentheses that ** needs in a dict display."""
+    if isinstance(v, ATOMS):
+        return short(v, budget)
+    r = short(v, budget - 2)
+    return r if r == "..." else f"({r})"
+
+
+def short_pair(k: ast.AST, v: ast.AST) -> str:
+    key = short(k)
+    return f"{key}: {short(v, max(ROWV - len(key) - 2, len('...')))}"
+
+
+def expandable(node: ast.BinOp) -> bool:
+    """A sum whose terms print safely side by side without parentheses, and that has a literal to expand."""
+    terms: list[ast.AST] = []
+    while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        terms.append(node.right)
+        node = node.left
+    terms.append(node)
+    simple = (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.Constant)
+    return all(isinstance(t, simple) for t in terms) and any(isinstance(t, (ast.List, ast.Tuple, ast.Set, ast.Dict)) for t in terms)
 
 
 def docstring(node: Documented, brief: bool) -> list[str]:
@@ -264,10 +358,10 @@ def args_of(fn: FuncDef) -> str:
 
 
 def deco_text(d: ast.expr) -> str:
-    """A decorator as written, with each argument longer than MAXV characters shown as "..."."""
+    """A decorator as written, with each argument longer than MAXV characters shortened as short() does."""
     if isinstance(d, ast.Call):
         args = [short(a) for a in d.args]
-        args += [f"{k.arg}={short(k.value)}" if k.arg else f"**{short(k.value)}" for k in d.keywords]
+        args += [f"{k.arg}={short(k.value)}" if k.arg else f"**{starred(k.value, MAXV)}" for k in d.keywords]
         return f"@{ast.unparse(d.func)}({', '.join(args)})"
     return "@" + ast.unparse(d)
 
@@ -344,7 +438,7 @@ def instance_attributes(cls: ast.ClassDef, known: set[str], qual: str, comments:
                     continue
                 seen.add(t.attr)
                 ann = f": {ast.unparse(node.annotation)}" if isinstance(node, ast.AnnAssign) else ""
-                val = f" = {short(node.value)}" if node.value is not None else ""
+                val = f" = {value_text(node.value)}" if node.value is not None else ""
                 out.append(Item("attr", t.attr, f"{qual}.{t.attr}", node.lineno, [f"self.{t.attr}{ann}{val}"],
                                 leading_comments(node.lineno, comments, only), trailing_comment(node, comments, only),
                                 private=t.attr.startswith("_")))
@@ -361,7 +455,7 @@ def make_class(cls: ast.ClassDef, mod_qual: str, comments: Comments, only: set[i
     fields, methods, inner = [], [], []
     for node in cls.body:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            s = f"{node.target.id}: {ast.unparse(node.annotation)}" + (f" = {short(node.value)}" if node.value is not None else "")
+            s = f"{node.target.id}: {ast.unparse(node.annotation)}" + (f" = {value_text(node.value)}" if node.value is not None else "")
             fields.append(Item("field", node.target.id, f"{qual}.{node.target.id}", node.lineno, [s],
                                leading_comments(node.lineno, comments, only), trailing_comment(node, comments, only),
                                private=node.target.id.startswith("_")))
@@ -369,7 +463,7 @@ def make_class(cls: ast.ClassDef, mod_qual: str, comments: Comments, only: set[i
             n = node.targets[0].id
             if n.startswith("__") and n.endswith("__"):
                 continue
-            fields.append(Item("field", n, f"{qual}.{n}", node.lineno, [f"{n} = {short(node.value)}"],
+            fields.append(Item("field", n, f"{qual}.{n}", node.lineno, [f"{n} = {value_text(node.value)}"],
                                leading_comments(node.lineno, comments, only), trailing_comment(node, comments, only),
                                private=n.startswith("_")))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -419,6 +513,26 @@ def executed(nodes: Iterable[ast.AST]) -> Iterator[ast.AST]:
             stack.extend(ast.iter_child_nodes(n))
 
 
+def is_main_guard(node: ast.stmt) -> bool:
+    """if __name__ == "__main__": what runs only as a script, whose variables are not the module's names."""
+    t = node.test if isinstance(node, ast.If) else None
+    return (isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq)
+            and {ast.unparse(t.left), ast.unparse(t.comparators[0])} == {"__name__", "'__main__'"})
+
+
+def main_guards(body: list[ast.stmt]) -> Iterator[ast.If]:
+    """The __main__ guards among module-level statements, inside module-level if and try blocks too."""
+    for node in body:
+        if isinstance(node, ast.If):
+            if is_main_guard(node):
+                yield node
+            yield from main_guards(node.body)
+            yield from main_guards(node.orelse)
+        elif isinstance(node, ast.Try) or (hasattr(ast, "TryStar") and isinstance(node, ast.TryStar)):
+            for part in (node.body, *(h.body for h in node.handlers), node.orelse, node.finalbody):
+                yield from main_guards(part)
+
+
 def module_statements(body: list[ast.stmt], context: str | None = None) -> Iterator[tuple[ast.stmt, str | None]]:
     """Top-level statements, descending into module-level if/try blocks. Yields (node, context),
     where context names the block a definition sits in, such as "in: if TYPE_CHECKING"."""
@@ -440,43 +554,53 @@ def module_statements(body: list[ast.stmt], context: str | None = None) -> Itera
 
 def parse_module(path: str, src: str, private: bool, brief: bool) -> Module:
     mod_qual = path[:-3].replace("/", ".").replace("\\", ".")
-    try:
-        tree = ast.parse(src)
-    except SyntaxError as e:
-        return Module(path, [], [], error=f"could not parse: {e.msg} (line {e.lineno})")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            tree = ast.parse(src, filename=path)
+        except SyntaxError as e:
+            return Module(path, [], [], error=f"could not parse: {e.msg} (line {e.lineno})")
+    notes = [f"line {w.lineno}: {w.message}" if w.filename == path else str(w.message) for w in caught]
     comments, only = comment_map(src)
     classes, funcs, consts = [], [], []
     unlisted: list[Item] = []
-    hidden = 0
+    hidden_names: set[str] = set()          # private module-level names, counted once each
+    script = {id(n) for guard in main_guards(tree.body)                       # a script's variables; its else
+              for stmt in guard.body for n in ast.walk(stmt)}                  # runs on import and is kept
     for node, ctx in module_statements(tree.body):
         if isinstance(node, ast.ClassDef):
             c = make_class(node, mod_qual, comments, only, brief, ctx)
             if c.private and not private:
-                hidden += 1
+                hidden_names.add(c.name)
                 unlisted.append(c)
             else:
                 classes.append(c)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             f = make_def(node, f"{mod_qual}.{node.name}", comments, only, brief, ctx)
             if f.private and not private:
-                hidden += 1
+                hidden_names.add(f.name)
                 unlisted.append(f)
             else:
                 funcs.append(f)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             tgt = node.targets[0] if isinstance(node, ast.Assign) else node.target
-            dunder = isinstance(tgt, ast.Name) and is_dunder(tgt.id)
-            if isinstance(tgt, ast.Name) and (tgt.id.isupper() or dunder) and (private or dunder or not tgt.id.startswith("_")):
-                ann = f": {ast.unparse(node.annotation)}" if isinstance(node, ast.AnnAssign) else ""
-                val = f" = {short(node.value)}" if node.value is not None else ""
-                consts.append(Item("const", tgt.id, f"{mod_qual}.{tgt.id}", node.lineno, [f"{tgt.id}{ann}{val}"],
-                                   leading_comments(node.lineno, comments, only) + ([ctx] if ctx else []),
-                                   trailing_comment(node, comments, only)))
+            if not isinstance(tgt, ast.Name) or id(node) in script:
+                continue
+            if tgt.id.startswith("_") and not is_dunder(tgt.id) and not private:
+                hidden_names.add(tgt.id)
+                continue
+            ann = f": {ast.unparse(node.annotation)}" if isinstance(node, ast.AnnAssign) else ""
+            op = f" {OPS.get(type(node.op), '?')}= " if isinstance(node, ast.AugAssign) else " = "
+            val = f"{op}{value_text(node.value)}" if node.value is not None else ""
+            consts.append(Item("const", tgt.id, f"{mod_qual}.{tgt.id}", node.lineno, [f"{tgt.id}{ann}{val}"],
+                               leading_comments(node.lineno, comments, only) + ([ctx] if ctx else []),
+                               trailing_comment(node, comments, only)))
     key = lambda i: (i.name, i.lineno)
     items = sorted(classes, key=key) + sorted(funcs, key=key) + sorted(consts, key=key)
-    return Module(path, docstring(tree, brief), items, hidden, qual=mod_qual, imports=imports_of(tree, mod_qual),
-                  unlisted=unlisted, reexports=reexport_candidates(tree, mod_qual, comments, only),
-                  refs=call_refs(executed(module_level_code(tree.body))))
+    return Module(path, docstring(tree, brief), items, len(hidden_names), qual=mod_qual,
+                  imports=imports_of(tree, mod_qual), unlisted=unlisted,
+                  reexports=reexport_candidates(tree, mod_qual, comments, only),
+                  refs=call_refs(executed(module_level_code(tree.body))), empty=not tree.body, notes=notes)
 
 
 def package_of(mod_qual: str) -> str:
@@ -704,8 +828,8 @@ def link_calls(mods: list[Module]) -> None:
     index: dict[str, Item] = {}
     for m in mods:
         for it in m.items + m.unlisted:
-            if it.kind == "reexport":
-                continue
+            if it.kind not in ("def", "class"):      # a value, even a callable one, is not resolved: helper = cache(helper)
+                continue                             # must leave the def helper in the index
             index[it.qual] = it
             for mem in it.members:
                 if mem.kind in ("def", "class"):
@@ -819,7 +943,9 @@ def doc_block(lines: list[str], indent: str) -> list[str]:
 def item_text(it: Item, indent: str = "", here: str = "", calls: bool = True, marks: bool = True) -> list[str]:
     out = comment_block(it.lead, indent)
     if it.kind in ("field", "attr", "const", "reexport"):
-        return out + [indent + it.text[0] + (f"  # {it.tail}" if it.tail else "")]
+        lines = [indent + l for l in it.text[0].split("\n")]     # a long literal value spans lines
+        lines[-1] += f"  # {it.tail}" if it.tail else ""
+        return out + lines
     out += [indent + h for h in it.text[:-1]]
     sig = it.text[-1] + ":"
     if it.kind == "def":
@@ -871,7 +997,7 @@ def module_text(m: Module, calls: bool = True, marks: bool = True) -> list[str]:
             out.append("")
         out += item_text(it, "", m.qual, calls, marks)
     if m.hidden:
-        out += ["", f"# + {m.hidden} private module-level name{'s' if m.hidden != 1 else ''}"]
+        out += ([""] if out else []) + [f"# + {m.hidden} private module-level name{'s' if m.hidden != 1 else ''}"]
     return out or ["# no declarations"]
 
 
@@ -1009,7 +1135,12 @@ def html_lines(m: Module, names: dict[str, str], src_link: str | None, ids: Ids,
         ln = f'<a class="ln" href="{src_link}{m.path}#L{it.lineno}">{m.path.rsplit("/", 1)[-1]}:{it.lineno}</a>' if src_link is not None else ""
         if it.kind in ("field", "attr", "const", "reexport"):
             tc = f'  <span class="c"># {html.escape(it.tail)}</span>' if it.tail else ""
-            out.append(f"{indent}{sig}{tc}{ln}")
+            first, *rest = sig.split("\n")           # a long literal value spans lines: the source link stays on the first
+            out.append(f"{indent}{first}{ln}" + ("" if rest else tc))
+            out.extend(f'{indent}<span class="c">{l}</span>' if l.lstrip().startswith("# +") else f"{indent}{l}"
+                       for l in rest)
+            if rest:
+                out[-1] += tc
             return
         clines = call_html(it, indent + "    ") if it.kind == "def" else []
         if marks and it.kind == "def" and it.untyped:
@@ -1091,6 +1222,61 @@ def render_html(mods: list[Module], title: str, src_link: str | None, marks: boo
 
 # ---------------------------------------------------------------- diff
 
+DECL_HEAD = re.compile(r"(async def |def |class |@|self\.\w+\s*[:=]|\w+\s*(:[^=]*)?(=|[-+*/%@&|^<>]+=) )")
+
+
+def enclosing(lines: list[str], i: int, line: str, doc: list[bool]) -> str:
+    """The nearest line above lines[i] that is less indented than line and starts a declaration,
+    such as "urlpatterns = [" or "class Meta:", skipping docstring lines (doc[j] is true for
+    those); "" when line is not indented."""
+    def indent(l: str) -> int:
+        return len(l) - len(l.lstrip())
+    want = indent(line)
+    for j in range(min(i, len(lines)) - 1, -1, -1):
+        t = lines[j].strip()
+        if not doc[j] and indent(lines[j]) < want and DECL_HEAD.match(t):
+            return t
+    return ""
+
+
+def docstring_lines(lines: list[str]) -> list[bool]:
+    """Which lines of module_text output belong to a docstring, as doc_block writes them: an
+    opening line that starts with three quotes, through a closing line of three quotes alone."""
+    out, inside = [], False
+    for l in lines:
+        t = l.strip()
+        if inside:
+            out.append(True)
+            inside = t != '"""'
+        elif t.startswith('"""'):
+            out.append(True)
+            inside = not (len(t) >= 6 and t.endswith('"""'))
+        else:
+            out.append(False)
+    return out
+
+
+def hunk_context(body: list[str], new: list[str]) -> list[str]:
+    """Name the declaration each hunk changes, as git diff does: a row of a long list value
+    does not say whose it is. Only "@@" lines change."""
+    out = list(body)
+    doc = docstring_lines(new)
+    for h, line in enumerate(body):
+        if not line.startswith("@@"):
+            continue
+        at = int(re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", line).group(1)) - 1     # 0-based line in new
+        for l in body[h + 1:]:
+            if l.startswith("@@"):
+                break
+            if l[:1] in "+-" and l[1:].strip():        # the first changed line that is not blank
+                ctx = enclosing(new, at, l[1:], doc)
+                out[h] = f"{line} {ctx}" if ctx else line
+                break
+            if l[:1] != "-":                           # a removed line takes no place in new
+                at += 1
+    return out
+
+
 def render_diff(old: list[Module], new: list[Module], title: str) -> str:
     a = {m.path: module_text(m, calls=False, marks=False) for m in old}
     b = {m.path: module_text(m, calls=False, marks=False) for m in new}
@@ -1108,14 +1294,15 @@ def render_diff(old: list[Module], new: list[Module], title: str) -> str:
         elif status == "removed":
             body = ["-" + l for l in a[p]]
         else:
-            body = list(difflib.unified_diff(a[p], b[p], lineterm="", n=2))[2:]
+            body = hunk_context(list(difflib.unified_diff(a[p], b[p], lineterm="", n=2))[2:], b[p])
         out += [f"## `{p}` ({status})", "", "```diff", *body, "```", ""]
     return "\n".join(out)
 
 
 # ---------------------------------------------------------------- main
 
-def load(args: argparse.Namespace, ref: str | None) -> list[Module]:
+def load(args: argparse.Namespace, ref: str | None, warn: bool = True) -> list[Module]:
+    """Read, parse and link the modules. warn=False keeps parse warnings quiet, as for the old side of --diff."""
     skip = tuple(args.exclude or ()) + (() if args.include_tests else TEST_GLOBS)
     srcs = sources_from_git(args.path, ref, args.root, skip) if ref else sources_from_dir(args.path, skip)
     if not srcs:
@@ -1125,9 +1312,18 @@ def load(args: argparse.Namespace, ref: str | None) -> list[Module]:
     if not getattr(args, "no_calls", False):
         link_calls(mods)
     for m in mods:
-        if m.error:
+        if m.error and warn:
             print(f"warning: {m.path}: {m.error}", file=sys.stderr)
-    return mods
+        for note in m.notes if warn else []:
+            print(f"warning: {m.path}: {note}", file=sys.stderr)
+    # A file with no statements has nothing to show. It still counted above, as a package that
+    # names modules; links to it are dropped with it.
+    gone = {anchor(m.path) for m in mods if m.empty}
+    for m in mods:
+        for it in m.items:
+            if it.target in gone:
+                it.target = None
+    return [m for m in mods if not m.empty]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1159,7 +1355,7 @@ def run(argv: list[str] | None) -> int:
     t0 = time.perf_counter()
     name = a.name or Path(os.path.abspath(a.path)).name
     if a.diff:
-        sys.stdout.write(render_diff(load(a, a.diff[0]), load(a, a.diff[1]), f"{name}: declarations, {a.diff[0]} to {a.diff[1]}"))
+        sys.stdout.write(render_diff(load(a, a.diff[0], warn=False), load(a, a.diff[1]), f"{name}: declarations, {a.diff[0]} to {a.diff[1]}"))
         return 0
     mods = load(a, a.ref)
     if a.no_source_links:
